@@ -1,5 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
+<resources xmlns:xliff="urn:oasis:names:tc:xliff:document:1.2">
 
     <!-- Optimized charge notification -->
     <string name="optimized_charge_notification_channel_label">Optimized charge</string>
