@@ -652,21 +652,25 @@ public final class CachedAppOptimizer {
             char state = (char) fr.read();
 
             if (state == '1' || state == '0') {
+                // Also check freezer binder ioctl
+                getBinderFreezeInfo(Process.myPid());
                 supported = true;
             } else {
                 Slog.e(TAG_AM, "unexpected value in cgroup.freeze");
             }
         } catch (java.io.FileNotFoundException e) {
-            Slog.d(TAG_AM, "cgroup.freeze not present");
+            Slog.w(TAG_AM, "cgroup.freeze not present");
+        } catch (RuntimeException e) {
+            Slog.w(TAG_AM, "unable to read freezer info");
         } catch (Exception e) {
-            Slog.d(TAG_AM, "unable to read cgroup.freeze: " + e.toString());
+            Slog.w(TAG_AM, "unable to read cgroup.freeze: " + e.toString());
         }
 
         if (fr != null) {
             try {
                 fr.close();
             } catch (java.io.IOException e) {
-                Slog.e(TAG_AM, "Exception closing freezer.killable: " + e.toString());
+                Slog.e(TAG_AM, "Exception closing cgroup.freeze: " + e.toString());
             }
         }
 
@@ -976,6 +980,17 @@ public final class CachedAppOptimizer {
         // way to make sure binder interfaces are unfroze too.
         if (!opt.isForceFrozen()) {
             unfreezeAppLSP(app);
+            return;
+        }
+
+        try {
+            freezeBinder(pid, false);
+        } catch (RuntimeException e) {
+            Slog.e(TAG_AM, "Unable to force unfreeze binder for " + pid + " " + app.processName
+                    + ". Killing it");
+            app.killLocked("Unable to force unfreeze",
+                    ApplicationExitInfo.REASON_OTHER,
+                    ApplicationExitInfo.SUBREASON_FREEZER_BINDER_IOCTL, true);
             return;
         }
 
@@ -1441,6 +1456,25 @@ public final class CachedAppOptimizer {
 
                 if (pid == 0 || opt.isFrozen())
                     return;
+
+                try {
+                    if (freezeBinder(pid, true) != 0) {
+                        // Reschedule.
+                        Slog.i(TAG_AM, "Reschedule force freeze for " + pid + " " + name);
+                        freezeAppAsyncLSPForce(proc);
+                        return;
+                    }
+                } catch (RuntimeException e) {
+                    Slog.e(TAG_AM, "Unable to force freeze binder for " + pid + " " + name);
+                    mFreezeHandler.post(() -> {
+                        synchronized (mAm) {
+                            proc.killLocked("Unable to force freeze binder interface",
+                                    ApplicationExitInfo.REASON_OTHER,
+                                    ApplicationExitInfo.SUBREASON_FREEZER_BINDER_IOCTL, true);
+                        }
+                    });
+                    return;
+                }
 
                 try {
                     Process.setProcessFrozen(pid, proc.uid, true);
