@@ -731,9 +731,7 @@ public class PhoneWindowManager implements WindowManagerPolicy {
                 case MSG_HANDLE_ALL_APPS:
                     launchAllAppsAction();
                     break;
-                case MSG_RINGER_TOGGLE_CHORD:
-                    handleRingerChordGesture();
-                    break;
+
             }
         }
     }
