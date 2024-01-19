@@ -657,8 +657,8 @@ public class PermissionManagerService extends IPermissionManager.Stub {
             Permission bp = mRegistry.getPermission(info.name);
             added = bp == null;
             int fixedLevel = PermissionInfo.fixProtectionLevel(info.protectionLevel);
+            enforcePermissionCapLocked(info, tree);
             if (added) {
-                enforcePermissionCapLocked(info, tree);
                 bp = new Permission(info.name, tree.getPackageName(), Permission.TYPE_DYNAMIC);
             } else if (!bp.isDynamic()) {
                 throw new SecurityException("Not allowed to modify non-dynamic permission "
@@ -2249,6 +2249,46 @@ public class PermissionManagerService extends IPermissionManager.Stub {
     }
 
     /**
+     * If the package was below api 23, got the SYSTEM_ALERT_WINDOW permission automatically, and
+     * then updated past api 23, and the app does not satisfy any of the other SAW permission flags,
+     * the permission should be revoked.
+     *
+     * @param newPackage The new package that was installed
+     * @param oldPackage The old package that was updated
+     */
+    private void revokeSystemAlertWindowIfUpgradedPast23(
+            @NonNull AndroidPackage newPackage,
+            @NonNull AndroidPackage oldPackage) {
+        if (oldPackage.getTargetSdkVersion() >= Build.VERSION_CODES.M
+                || newPackage.getTargetSdkVersion() < Build.VERSION_CODES.M
+                || !newPackage.getRequestedPermissions()
+                .contains(Manifest.permission.SYSTEM_ALERT_WINDOW)) {
+            return;
+        }
+
+        Permission saw;
+        synchronized (mLock) {
+            saw = mRegistry.getPermission(Manifest.permission.SYSTEM_ALERT_WINDOW);
+        }
+        final PackageSetting ps = (PackageSetting)
+                mPackageManagerInt.getPackageSetting(newPackage.getPackageName());
+        if (shouldGrantPermissionByProtectionFlags(newPackage, ps, saw, new ArraySet<>())
+                    || shouldGrantPermissionBySignature(newPackage, saw)) {
+            return;
+        }
+        for (int userId : getAllUserIds()) {
+            try {
+                revokePermissionFromPackageForUser(newPackage.getPackageName(),
+                        Manifest.permission.SYSTEM_ALERT_WINDOW, false, userId,
+                        mDefaultPermissionCallback);
+            } catch (IllegalStateException | SecurityException e) {
+                Log.e(TAG, "unable to revoke SYSTEM_ALERT_WINDOW for "
+                        + newPackage.getPackageName() + " user " + userId, e);
+            }
+        }
+    }
+
+    /**
      * We might auto-grant permissions if any permission of the group is already granted. Hence if
      * the group of a granted permission changes we need to revoke it to avoid having permissions of
      * the new group auto-granted.
@@ -2764,7 +2804,6 @@ public class PermissionManagerService extends IPermissionManager.Stub {
                     final Permission bp = mRegistry.getPermission(permName);
                     final boolean appSupportsRuntimePermissions =
                             pkg.getTargetSdkVersion() >= Build.VERSION_CODES.M;
-                    String legacyActivityRecognitionPermission = null;
 
                     if (DEBUG_INSTALL && bp != null) {
                         Log.i(TAG, "Package " + friendlyName
@@ -2788,47 +2827,12 @@ public class PermissionManagerService extends IPermissionManager.Stub {
                     // Cache newImplicitPermissions before modifing permissionsState as for the
                     // shared uids the original and new state are the same object
                     if (!origState.hasPermissionState(permName)
-                            && (pkg.getImplicitPermissions().contains(permName)
-                            || (permName.equals(Manifest.permission.ACTIVITY_RECOGNITION)))) {
-                        if (pkg.getImplicitPermissions().contains(permName)) {
+                            && (pkg.getImplicitPermissions().contains(permName))) {
                             // If permName is an implicit permission, try to auto-grant
                             newImplicitPermissions.add(permName);
-
                             if (DEBUG_PERMISSIONS) {
                                 Slog.i(TAG, permName + " is newly added for " + friendlyName);
                             }
-                        } else {
-                            // Special case for Activity Recognition permission. Even if AR
-                            // permission is not an implicit permission we want to add it to the
-                            // list (try to auto-grant it) if the app was installed on a device
-                            // before AR permission was split, regardless of if the app now requests
-                            // the new AR permission or has updated its target SDK and AR is no
-                            // longer implicit to it. This is a compatibility workaround for apps
-                            // when AR permission was split in Q.
-                            // TODO(zhanghai): This calls into SystemConfig, which generally
-                            //  shouldn't  cause deadlock, but maybe we should keep a cache of the
-                            //  split permission  list and just eliminate the possibility.
-                            final List<PermissionManager.SplitPermissionInfo> permissionList =
-                                    getSplitPermissionInfos();
-                            int numSplitPerms = permissionList.size();
-                            for (int splitPermNum = 0; splitPermNum < numSplitPerms;
-                                    splitPermNum++) {
-                                PermissionManager.SplitPermissionInfo sp = permissionList.get(
-                                        splitPermNum);
-                                String splitPermName = sp.getSplitPermission();
-                                if (sp.getNewPermissions().contains(permName)
-                                        && origState.isPermissionGranted(splitPermName)) {
-                                    legacyActivityRecognitionPermission = splitPermName;
-                                    newImplicitPermissions.add(permName);
-
-                                    if (DEBUG_PERMISSIONS) {
-                                        Slog.i(TAG, permName + " is newly added for "
-                                                + friendlyName);
-                                    }
-                                    break;
-                                }
-                            }
-                        }
                     }
 
                     // TODO(b/140256621): The package instant app method has been removed
@@ -2878,29 +2882,55 @@ public class PermissionManagerService extends IPermissionManager.Stub {
                                 + pkg.getPackageName());
                     }
 
-                    if ((bp.isNormal() && shouldGrantNormalPermission)
-                            || (bp.isSignature()
-                                    && (!bp.isPrivileged() || CollectionUtils.contains(
-                                            isPrivilegedPermissionAllowlisted, permName))
-                                    && (CollectionUtils.contains(shouldGrantSignaturePermission,
-                                            permName)
-                                            || (((bp.isPrivileged() && CollectionUtils.contains(
-                                                    shouldGrantPrivilegedPermissionIfWasGranted,
-                                                    permName)) || bp.isDevelopment() || bp.isRole())
-                                                    && origState.isPermissionGranted(permName))))
-                            || (bp.isInternal()
-                                    && (!bp.isPrivileged() || CollectionUtils.contains(
-                                            isPrivilegedPermissionAllowlisted, permName))
-                                    && (CollectionUtils.contains(shouldGrantInternalPermission,
-                                            permName)
-                                            || (((bp.isPrivileged() && CollectionUtils.contains(
-                                                    shouldGrantPrivilegedPermissionIfWasGranted,
-                                                    permName)) || bp.isDevelopment() || bp.isRole())
-                                                    && origState.isPermissionGranted(permName))))) {
-                        // Grant an install permission.
-                        if (uidState.grantPermission(bp)) {
-                            changedInstallPermission = true;
+                    if (bp.isNormal() || bp.isSignature() || bp.isInternal()) {
+                        if ((bp.isNormal() && shouldGrantNormalPermission)
+                                || (bp.isSignature()
+                                        && (!bp.isPrivileged() || CollectionUtils.contains(
+                                                isPrivilegedPermissionAllowlisted, permName))
+                                        && (CollectionUtils.contains(shouldGrantSignaturePermission,
+                                                permName)
+                                                || (((bp.isPrivileged() && CollectionUtils.contains(
+                                                        shouldGrantPrivilegedPermissionIfWasGranted,
+                                                        permName)) || bp.isDevelopment()
+                                                                || bp.isRole())
+                                                        && origState.isPermissionGranted(
+                                                                permName))))
+                                || (bp.isInternal()
+                                        && (!bp.isPrivileged() || CollectionUtils.contains(
+                                                isPrivilegedPermissionAllowlisted, permName))
+                                        && (CollectionUtils.contains(shouldGrantInternalPermission,
+                                                permName)
+                                                || (((bp.isPrivileged() && CollectionUtils.contains(
+                                                        shouldGrantPrivilegedPermissionIfWasGranted,
+                                                        permName)) || bp.isDevelopment()
+                                                                || bp.isRole())
+                                                        && origState.isPermissionGranted(
+                                                                permName))))) {
+                            // Grant an install permission.
+                            if (uidState.grantPermission(bp)) {
+                                changedInstallPermission = true;
+                            }
+                        } else {
+                            if (DEBUG_PERMISSIONS) {
+                                boolean wasGranted = uidState.isPermissionGranted(bp.getName());
+                                if (wasGranted || bp.isAppOp()) {
+                                    Slog.i(TAG, (wasGranted ? "Un-granting" : "Not granting")
+                                            + " permission " + perm
+                                            + " from package " + friendlyName
+                                            + " (protectionLevel=" + bp.getProtectionLevel()
+                                            + " flags=0x"
+                                            + Integer.toHexString(PackageInfoUtils.appInfoFlags(pkg,
+                                            ps))
+                                            + ")");
+                                }
+                            }
+                            if (uidState.revokePermission(bp)) {
+                                changedInstallPermission = true;
+                            }
                         }
+                        PermissionState origPermState = origState.getPermissionState(perm);
+                        int flags = origPermState != null ? origPermState.getFlags() : 0;
+                        uidState.updatePermissionFlags(bp, MASK_PERMISSION_FLAGS_ALL, flags);
                     } else if (bp.isRuntime()) {
                         boolean hardRestricted = bp.isHardRestricted();
                         boolean softRestricted = bp.isSoftRestricted();
@@ -2959,8 +2989,7 @@ public class PermissionManagerService extends IPermissionManager.Stub {
                             // Hard restricted permissions cannot be held.
                             } else if (!permissionPolicyInitialized
                                     || (!hardRestricted || restrictionExempt)) {
-                                if ((origPermState != null && origPermState.isGranted())
-                                        || legacyActivityRecognitionPermission != null) {
+                                if ((origPermState != null && origPermState.isGranted())) {
                                     if (!uidState.grantPermission(bp)) {
                                         wasChanged = true;
                                     }
@@ -3015,22 +3044,8 @@ public class PermissionManagerService extends IPermissionManager.Stub {
                         uidState.updatePermissionFlags(bp, MASK_PERMISSION_FLAGS_ALL,
                                 flags);
                     } else {
-                        if (DEBUG_PERMISSIONS) {
-                            boolean wasGranted = uidState.isPermissionGranted(bp.getName());
-                            if (wasGranted || bp.isAppOp()) {
-                                Slog.i(TAG, (wasGranted ? "Un-granting" : "Not granting")
-                                        + " permission " + perm
-                                        + " from package " + friendlyName
-                                        + " (protectionLevel=" + bp.getProtectionLevel()
-                                        + " flags=0x"
-                                        + Integer.toHexString(PackageInfoUtils.appInfoFlags(pkg,
-                                                ps))
-                                        + ")");
-                            }
-                        }
-                        if (uidState.removePermissionState(bp.getName())) {
-                            changedInstallPermission = true;
-                        }
+                        Slog.wtf(LOG_TAG, "Unknown permission protection " + bp.getProtection()
+                                + " for permission " + bp.getName());
                     }
                 }
 
@@ -4851,6 +4866,7 @@ public class PermissionManagerService extends IPermissionManager.Stub {
                 if (hasOldPkg) {
                     revokeRuntimePermissionsIfGroupChangedInternal(pkg, oldPkg);
                     revokeStoragePermissionsIfScopeExpandedInternal(pkg, oldPkg);
+                    revokeSystemAlertWindowIfUpgradedPast23(pkg, oldPkg);
                 }
                 if (hasPermissionDefinitionChanges) {
                     revokeRuntimePermissionsIfPermissionDefinitionChangedInternal(
@@ -5646,7 +5662,7 @@ public class PermissionManagerService extends IPermissionManager.Stub {
                     if (resolvedPackageName == null) {
                         return;
                     }
-                    appOpsManager.finishOp(accessorSource.getToken(), op,
+                    appOpsManager.finishOp(attributionSourceState.token, op,
                             accessorSource.getUid(), resolvedPackageName,
                             accessorSource.getAttributionTag());
                 } else {
@@ -5655,8 +5671,9 @@ public class PermissionManagerService extends IPermissionManager.Stub {
                     if (resolvedAttributionSource.getPackageName() == null) {
                         return;
                     }
-                    appOpsManager.finishProxyOp(AppOpsManager.opToPublicName(op),
-                            resolvedAttributionSource, skipCurrentFinish);
+                    appOpsManager.finishProxyOp(attributionSourceState.token,
+                            AppOpsManager.opToPublicName(op), resolvedAttributionSource,
+                            skipCurrentFinish);
                 }
 
                 if (next == null || next.getNext() == null) {
@@ -5766,10 +5783,11 @@ public class PermissionManagerService extends IPermissionManager.Stub {
                         && next.getNext() == null);
                 final boolean selfAccess = singleReceiverFromDatasource || next == null;
 
-                final int opMode = performOpTransaction(context, op, current, message,
-                        forDataDelivery, /*startDataDelivery*/ false, skipCurrentChecks,
-                        selfAccess, singleReceiverFromDatasource, AppOpsManager.OP_NONE,
-                        AppOpsManager.ATTRIBUTION_FLAGS_NONE, AppOpsManager.ATTRIBUTION_FLAGS_NONE,
+                final int opMode = performOpTransaction(context, attributionSource.getToken(), op,
+                        current, message, forDataDelivery, /*startDataDelivery*/ false,
+                        skipCurrentChecks, selfAccess, singleReceiverFromDatasource,
+                        AppOpsManager.OP_NONE, AppOpsManager.ATTRIBUTION_FLAGS_NONE,
+                        AppOpsManager.ATTRIBUTION_FLAGS_NONE,
                         AppOpsManager.ATTRIBUTION_CHAIN_ID_NONE);
 
                 switch (opMode) {
@@ -5871,10 +5889,10 @@ public class PermissionManagerService extends IPermissionManager.Stub {
                         attributionSource, next, fromDatasource, startDataDelivery, selfAccess,
                         isLinkTrusted) : ATTRIBUTION_FLAGS_NONE;
 
-                final int opMode = performOpTransaction(context, op, current, message,
-                        forDataDelivery, startDataDelivery, skipCurrentChecks, selfAccess,
-                        singleReceiverFromDatasource, attributedOp, proxyAttributionFlags,
-                        proxiedAttributionFlags, attributionChainId);
+                final int opMode = performOpTransaction(context, attributionSource.getToken(), op,
+                        current, message, forDataDelivery, startDataDelivery, skipCurrentChecks,
+                        selfAccess, singleReceiverFromDatasource, attributedOp,
+                        proxyAttributionFlags, proxiedAttributionFlags, attributionChainId);
 
                 switch (opMode) {
                     case AppOpsManager.MODE_ERRORED: {
@@ -6019,8 +6037,8 @@ public class PermissionManagerService extends IPermissionManager.Stub {
                         attributionSource, next, /*fromDatasource*/ false, startDataDelivery,
                         selfAccess, isLinkTrusted) : ATTRIBUTION_FLAGS_NONE;
 
-                final int opMode = performOpTransaction(context, op, current, message,
-                        forDataDelivery, startDataDelivery, skipCurrentChecks, selfAccess,
+                final int opMode = performOpTransaction(context, current.getToken(), op, current,
+                        message, forDataDelivery, startDataDelivery, skipCurrentChecks, selfAccess,
                         /*fromDatasource*/ false, AppOpsManager.OP_NONE, proxyAttributionFlags,
                         proxiedAttributionFlags, attributionChainId);
 
@@ -6042,7 +6060,8 @@ public class PermissionManagerService extends IPermissionManager.Stub {
         }
 
         @SuppressWarnings("ConstantConditions")
-        private static int performOpTransaction(@NonNull Context context, int op,
+        private static int performOpTransaction(@NonNull Context context,
+                @NonNull IBinder chainStartToken, int op,
                 @NonNull AttributionSource attributionSource, @Nullable String message,
                 boolean forDataDelivery, boolean startDataDelivery, boolean skipProxyOperation,
                 boolean selfAccess, boolean singleReceiverFromDatasource, int attributedOp,
@@ -6104,7 +6123,7 @@ public class PermissionManagerService extends IPermissionManager.Stub {
                 if (selfAccess) {
                     try {
                         startedOpResult = appOpsManager.startOpNoThrow(
-                                resolvedAttributionSource.getToken(), startedOp,
+                                chainStartToken, startedOp,
                                 resolvedAttributionSource.getUid(),
                                 resolvedAttributionSource.getPackageName(),
                                 /*startIfModeDefault*/ false,
@@ -6115,12 +6134,12 @@ public class PermissionManagerService extends IPermissionManager.Stub {
                                 + " platform defined runtime permission "
                                 + AppOpsManager.opToPermission(op) + " while not having "
                                 + Manifest.permission.UPDATE_APP_OPS_STATS);
-                        startedOpResult = appOpsManager.startProxyOpNoThrow(attributedOp,
-                                attributionSource, message, skipProxyOperation,
+                        startedOpResult = appOpsManager.startProxyOpNoThrow(chainStartToken,
+                                attributedOp, attributionSource, message, skipProxyOperation,
                                 proxyAttributionFlags, proxiedAttributionFlags, attributionChainId);
                     }
                 } else {
-                    startedOpResult = appOpsManager.startProxyOpNoThrow(startedOp,
+                    startedOpResult = appOpsManager.startProxyOpNoThrow(chainStartToken, startedOp,
                             resolvedAttributionSource, message, skipProxyOperation,
                             proxyAttributionFlags, proxiedAttributionFlags, attributionChainId);
                 }

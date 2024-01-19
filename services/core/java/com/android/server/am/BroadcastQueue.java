@@ -768,6 +768,54 @@ public final class BroadcastQueue {
             }
         }
 
+        // Check that the receiver does *not* have any excluded permissions
+        if (!skip && r.excludedPermissions != null && r.excludedPermissions.length > 0) {
+            for (int i = 0; i < r.excludedPermissions.length; i++) {
+                String excludedPermission = r.excludedPermissions[i];
+                final int perm = mService.checkComponentPermission(excludedPermission,
+                        filter.receiverList.pid, filter.receiverList.uid, -1, true);
+
+                int appOp = AppOpsManager.permissionToOpCode(excludedPermission);
+                if (appOp != AppOpsManager.OP_NONE) {
+                    // When there is an app op associated with the permission,
+                    // skip when both the permission and the app op are
+                    // granted.
+                    if ((perm == PackageManager.PERMISSION_GRANTED) && (
+                            mService.getAppOpsManager().checkOpNoThrow(appOp,
+                                    filter.receiverList.uid,
+                                    filter.packageName)
+                                    == AppOpsManager.MODE_ALLOWED)) {
+                        Slog.w(TAG, "Appop Denial: receiving "
+                                + r.intent.toString()
+                                + " to " + filter.receiverList.app
+                                + " (pid=" + filter.receiverList.pid
+                                + ", uid=" + filter.receiverList.uid + ")"
+                                + " excludes appop " + AppOpsManager.permissionToOp(
+                                excludedPermission)
+                                + " due to sender " + r.callerPackage
+                                + " (uid " + r.callingUid + ")");
+                        skip = true;
+                        break;
+                    }
+                } else {
+                    // When there is no app op associated with the permission,
+                    // skip when permission is granted.
+                    if (perm == PackageManager.PERMISSION_GRANTED) {
+                        Slog.w(TAG, "Permission Denial: receiving "
+                                + r.intent.toString()
+                                + " to " + filter.receiverList.app
+                                + " (pid=" + filter.receiverList.pid
+                                + ", uid=" + filter.receiverList.uid + ")"
+                                + " excludes " + excludedPermission
+                                + " due to sender " + r.callerPackage
+                                + " (uid " + r.callingUid + ")");
+                        skip = true;
+                        break;
+                    }
+                }
+            }
+        }
+
         // Check that the receiver does *not* belong to any of the excluded packages
         if (!skip && r.excludedPackages != null && r.excludedPackages.length > 0) {
             if (ArrayUtils.contains(r.excludedPackages, filter.packageName)) {
@@ -798,6 +846,17 @@ public final class BroadcastQueue {
                     + " due to sender " + r.callerPackage
                     + " (uid " + r.callingUid + ")");
             skip = true;
+        }
+
+        if (!skip) {
+            synchronized (mService.mProcLock) {
+                if (filter.receiverList.app.mOptRecord.ignoreTempUnfreeze()) {
+                    Slog.i(TAG, "Skipping delivery " + r.intent
+                            + " to " + filter.receiverList.app
+                            + "(registered) because of force freeze");
+                    skip = true;
+                }
+            }
         }
 
         if (skip) {
@@ -1017,12 +1076,6 @@ public final class BroadcastQueue {
         return r.intent.toString()
                 + " from " + r.callerPackage + " (pid=" + r.callingPid
                 + ", uid=" + r.callingUid + ") to " + component.flattenToShortString();
-    }
-
-    private boolean isBootCompletedIntent(Intent intent) {
-        return Intent.ACTION_BOOT_COMPLETED.equals(intent.getAction()) ||
-                Intent.ACTION_LOCKED_BOOT_COMPLETED.equals(intent.getAction()) ||
-                Intent.ACTION_MEDIA_MOUNTED.equals(intent.getAction());
     }
 
     final void processNextBroadcastLocked(boolean fromMsg, boolean skipOomAdj) {
@@ -1397,14 +1450,7 @@ public final class BroadcastQueue {
                 info.activityInfo.name);
 
         boolean skip = false;
-        if (isBootCompletedIntent(r.intent) &&
-                mService.shouldSkipBootCompletedBroadcastForPackage(
-                        info.activityInfo.applicationInfo)) {
-            Slog.i(TAG, "Boot broadcast skipped for "
-                    + info.activityInfo.applicationInfo.packageName);
-            skip = true;
-        }
-        if (!skip && brOptions != null &&
+        if (brOptions != null &&
                 (info.activityInfo.applicationInfo.targetSdkVersion
                         < brOptions.getMinManifestReceiverApiLevel() ||
                 info.activityInfo.applicationInfo.targetSdkVersion
@@ -1678,6 +1724,27 @@ public final class BroadcastQueue {
         if (!skip && r.appOp != AppOpsManager.OP_NONE) {
             if (!noteOpForManifestReceiver(r.appOp, r, info, component)) {
                 skip = true;
+            }
+        }
+
+        if (!skip) {
+            if (app != null) {
+                synchronized (mService.mProcLock) {
+                    if (app.mOptRecord.ignoreTempUnfreeze()) {
+                        Slog.i(TAG, "Skipping delivery " + r.intent
+                                + " to " + app
+                                + " because of force freeze");
+                        skip = true;
+                    }
+                }
+            } else {
+                // Application not running, skip if blacklisted.
+                if (mService.isBackgroundRestricted(info.activityInfo.applicationInfo)) {
+                    Slog.i(TAG, "Skipping delivery " + r.intent
+                                + " to " + info.activityInfo.applicationInfo.packageName
+                                + " because of restriction");
+                    skip = true;
+                }
             }
         }
 

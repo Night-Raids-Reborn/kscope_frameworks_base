@@ -286,7 +286,7 @@ public final class MediaSession {
     @Deprecated
     public void setMediaButtonReceiver(@Nullable PendingIntent mbr) {
         try {
-            mBinder.setMediaButtonReceiver(mbr, mContext.getPackageName());
+            mBinder.setMediaButtonReceiver(mbr);
         } catch (RemoteException e) {
             Log.wtf(TAG, "Failure in setMediaButtonReceiver.", e);
         }
@@ -297,9 +297,11 @@ public final class MediaSession {
      * class that should receive media buttons. This allows restarting playback after the session
      * has been stopped. If your app is started in this way an {@link Intent#ACTION_MEDIA_BUTTON}
      * intent will be sent to the broadcast receiver.
-     * <p>
-     * Note: The given {@link android.content.BroadcastReceiver} should belong to the same package
-     * as the context that was given when creating {@link MediaSession}.
+     *
+     * <p>Note: The given {@link android.content.BroadcastReceiver} should belong to the same
+     * package as the context that was given when creating {@link MediaSession}.
+     *
+     * <p>Calls with invalid or non-existent receivers will be ignored.
      *
      * @param broadcastReceiver the component name of the BroadcastReceiver class
      */
